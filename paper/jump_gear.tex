@@ -1,0 +1,535 @@
+\documentclass[11pt]{amsart}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{booktabs}
+\usepackage[margin=1in]{geometry}
+\usepackage[hidelinks]{hyperref}
+
+\setlength{\emergencystretch}{3em}
+
+\newcommand{\lean}[1]{\texttt{\detokenize{#1}}}
+\newcommand{\fn}[1]{\mathrm{#1}}
+\newcommand{\leanref}[1]{\par\nopagebreak\smallskip
+  {\small\raggedright\noindent Lean: #1\par}\medskip}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+
+\title[A verified jump gear above $2^{64}$]{A formally verified jump gear for segmented
+sieving above $2^{64}$}
+\author{Artur Flamandzki}
+\date{}
+
+\begin{document}
+
+\begin{abstract}
+A segmented sieve of Eratosthenes on a window $[F, F+W)$ far above $2^{64}$ spends most of its
+time on sieving primes larger than the window, which hit it at most once and usually not at
+all. The \emph{jump gear} of the PrimeAtlas engines v7 handles these numbers without computing
+$F \bmod q$ for each of them: on blocks of $q$ it replaces $F/q$ by a tangent line, turns the
+landing condition into a rotation on $\mathbb{Z}/2^{64}$ in 64.64 fixed point, finds the first
+candidate by a Euclid-like recursion and steps through the others by the three-gap theorem.
+The mathematical core of the method is Helfgott's improved sieve of
+Eratosthenes~\cite{helfgott}. We prove in Lean~4 / Mathlib that the C code of the gear, as
+written, visits every landing of a block and computes its offset exactly, for engines v7.0,
+v7.1 and v7.2. The model covers 128- and 64-bit wraparound, the truncations of the
+fixed-point quantities, the tangent error, and a threshold computed in IEEE-754 double
+precision under the standard rounding model. The proof gives the engine bound
+$30F < 2^{128}$, and a concrete instance, checked by the kernel, shows that the engines'
+earlier guard $F < 2^{126}$ let a 128-bit product overflow; the engines now use the proved
+bound. A certificate proved along the way lets a block keep the three-gap steps of the
+previous one; engine v7.4 uses it. We also prove that the engines' gear threshold and block
+factor are the optimum of their cost model. Every statement in the results section is a
+theorem of the accompanying Lean formalization, which builds with no \lean{sorry} and uses
+only the axioms \lean{propext}, \lean{Quot.sound} and \lean{Classical.choice}.
+\end{abstract}
+
+\maketitle
+
+\section{Introduction}
+
+A segmented sieve of Eratosthenes~\cite{bayshudson} marks, in a window $[F, F+W)$, the
+multiples of every prime up to $\sqrt{F+W}$. Far above $2^{64}$ two things change. The
+sieving primes reach $3\cdot 10^{12}$ at $F = 10^{25}$ and $10^{16}$ at $F = 10^{32}$, so most
+of them exceed the window and hit it at most once; and the phase $F \bmod p$ of each prime
+needs 128-bit arithmetic. A sieve that visits every prime then pays per prime, not per hit.
+
+The PrimeAtlas engines produce prime data for windows at such floors. Their \emph{jump
+gear} (engines v7.0--v7.4) asks the opposite question: which large $q$ have a multiple in the
+window. It answers it from the window's position, block by block, without visiting the
+others. Helfgott~\cite{helfgott} gave this method first, with continued fractions in place
+of the three-gap steps used here, and with an implementation tested up to $5\cdot 10^{18}$.
+Section~\ref{sec:prior} compares the two.
+
+\subsection*{Contributions}
+\begin{enumerate}
+  \item[(C1)] A Lean proof that the C code of the gear, transcribed with explicit
+    wraparound and a double-precision rounding model, finds every landing of a block with
+    its exact offset, under stated preconditions (Theorem~\ref{thm:main}).
+  \item[(C2)] The engine bound $30F < 2^{128}$ that the proof requires, and a kernel-checked
+    instance showing that the earlier guard $F < 2^{126}$ was too weak
+    (Theorem~\ref{thm:overflow}). The engines were changed to the proved bound.
+  \item[(C3)] A certificate for the three-gap steps that holds regardless of how the steps
+    were obtained (Theorem~\ref{thm:cert}), used by engine v7.4 to skip most block setups.
+  \item[(C4)] Optimality of the engines' gear threshold and block factor within their cost
+    model (Theorem~\ref{thm:cost}).
+\end{enumerate}
+Measurements of the engines are reported in Section~\ref{sec:bench}; they are not part of
+the formal results.
+
+\section{Setting}\label{sec:setting}
+
+Throughout, $F \ge 1$ is the lower end of the window, $W \ge 1$ its width, $M = 2^{64}$, and
+$x \bmod m$ is the remainder of $x$ on division by $m$.
+
+\begin{definition}[Landing]
+For $q \ge 1$ let $g(q) = (q - F \bmod q) \bmod q$. The number $q$ \emph{lands} if
+$g(q) < W$; then $F + g(q)$ is the least multiple of $q$ that is $\ge F$, and it lies in the
+window.
+\end{definition}
+
+The gear walks blocks $q = Q + 30j$, $0 \le j < J$, in each of the eight residue classes
+coprime to $30$, composite $q$ included. Its fixed-point quantities are
+\[
+  X_0 = \Big\lfloor \frac{F M}{Q} \Big\rfloor,\qquad
+  S = \Big\lfloor \frac{a}{Q} \Big\rfloor M + \Big\lfloor \frac{(a \bmod Q) M}{Q}\Big\rfloor
+    + \Big\lfloor \frac{r_1 M}{Q^2}\Big\rfloor,\quad a = \Big\lfloor \frac{30F}{Q}\Big\rfloor,\
+    r_1 = 30F - aQ,
+\]
+so that $0 \le FM/Q - X_0 < 1$ and $0 \le 30FM/Q^2 - S < 2$. With $\fn{slack} = 2J + 8$,
+\[
+  A = (\fn{slack} - X_0) \bmod M,\qquad B = S \bmod M,\qquad v(j) = (A + Bj) \bmod M .
+\]
+
+\begin{definition}[Candidate condition and threshold]
+The index $j$ is a \emph{candidate} if $v(j) < T$. The engines compute
+\[
+  t_d = \frac{W}{Q}\,M + 1.001\cdot\frac{F\,d_{\max}^2}{Q^3}\,M + 2\,\fn{slack} + 1,
+  \qquad d_{\max} = 30(J-1),
+\]
+in double precision and set $T = \lfloor t_d \rfloor$; when $t_d \ge 1.8\cdot 10^{19}$ every
+$j$ of the block is checked directly.
+\end{definition}
+
+\begin{definition}[Search and steps]
+$\fn{first}(a, m, l, r)$ is the recursion
+\[
+\fn{first}(a, m, l, r) = \begin{cases}
+ 0 & l = 0,\\
+ \text{none} & a \bmod m = 0,\\
+ \lceil l/a \rceil & a\lceil l/a\rceil \le r,\\
+ \big\lceil (l + m\,y)/a \big\rceil,\ y = \fn{first}(m \bmod a,\ a,\ (-r) \bmod a,\
+   (-l) \bmod a) & \text{otherwise,}
+\end{cases}
+\]
+with $a$ reduced mod $m$. For $T \le M$ let $g_a$ be the least $g \ge 1$ with
+$Bg \bmod M < T$, $g_c$ the least $g \ge 1$ with $Bg \bmod M > M - T$,
+$\alpha = Bg_a \bmod M$ and $\beta = M - (Bg_c \bmod M)$. The \emph{step rule} moves from a
+candidate $v$ by $g_a$ if $v + \alpha < T$, by $g_c$ if $v \ge \beta$, and by $g_a + g_c$
+otherwise.
+\end{definition}
+
+The engines find the first candidate $j_0$ with $\fn{first}$ on the arc shifted by $A$ (split
+when it wraps), and the steps $(g_a, g_c)$ either by two more searches (v7.0, v7.1) or by one
+subtractive Euclid walk on $d_a = Bg_a \bmod M$ and $d_c = (-Bg_c) \bmod M$ (v7.2), falling
+back to the searches when the walk cannot decide. Each candidate is checked exactly: an
+estimate $k = \lfloor (X_0 - Sj)/M \rfloor + 1$ of $\lceil F/q \rceil$ is corrected by two
+loops to the least multiple of $q$ that is $\ge F$, and its offset is kept if it is below $W$.
+
+\section{Results}\label{sec:results}
+
+All C routines named below are in \lean{prime_sieve/engine_jump_gear.h} of the PrimeAtlas
+repository~\cite{atlas}. Each is transcribed as a function on natural numbers in which every
+128-bit operation is reduced mod $2^{128}$ and every 64-bit one mod $2^{64}$. The
+double-precision threshold is modelled by the standard model of floating-point
+arithmetic~\cite{higham}: every operation and every conversion from \lean{uint64_t} returns
+$x(1+\delta)$ with $|\delta| \le 2^{-53}$, which holds for IEEE-754
+round-to-nearest~\cite{ieee754} without underflow.
+
+\subsection*{T1 The sieve argument}
+\begin{theorem}\label{thm:sieve}
+Let $S$ be a set of numbers that contains every prime $p$ with $p^2 < F + W$ that has a
+multiple in $[F, F+W)$. Then a number $n \ge 2$ of the window is prime if and only if no
+$d \in S$ with $2 \le d < n$ divides $n$. Moreover, for $q \ge W$ at most one multiple of $q$
+lies in the window, it exists if and only if $g(q) < W$, and a multiple $m \ge F$ of any $q$
+with $2 \le q < F$ is not prime.
+\end{theorem}
+\leanref{\lean{sieve_correct}, \lean{at_most_one}, \lean{landing_iff},
+\lean{composite_harmless}}
+
+So sieving by composite $q$ in addition to the primes does not change the output.
+
+\subsection*{T2 The block routine}
+\begin{theorem}\label{thm:main}
+Assume
+\[
+ 8 \le Q,\quad Q + 30J < 2^{64},\quad Q \le F < 2^{62} Q,\quad 60J \le Q,\quad
+ 1 \le W \le 2^{48},\quad 30F < 2^{128},
+\]
+let $t_d$ be computed as in the C code under the standard rounding model with
+$t_d < 1.8\cdot 10^{19}$, $T = \lfloor t_d \rfloor$, and let $j_0$ and $(g_a, g_c)$ be the
+results of the engine's searches. Then for every $j < J$ with $g(Q + 30j) < W$, the C loop
+started at $(j_0, v(j_0))$ reaches $j$ before it leaves the block, the 128-bit estimate it
+uses does not wrap, and the exact check returns $g(Q + 30j)$.
+\end{theorem}
+\leanref{\lean{jump_block_quick_exact} (v7.2: \lean{jump_first_range64} and
+\lean{jump_gaps}), \lean{jump_block_exact} (v7.0, v7.1: three calls of
+\lean{jump_first_range})}
+
+The proof combines the following lemmas.
+
+\begin{lemma}\label{lem:first}
+For $l \le r < m$, $\fn{first}(a, m, l, r)$ is the least $x$ with $l \le ax \bmod m \le r$,
+and it is none exactly when no such $x$ exists. The same holds for the shifted, possibly
+wrapped arc, and for the 64-bit variant of v7.2 with results $\ge 2^{64}$ dropped.
+\end{lemma}
+\leanref{\lean{firstIn_spec}, \lean{firstRange_spec}, \lean{firstRange64_spec}}
+
+\begin{lemma}\label{lem:step}
+Let $T \le M$. From a candidate $v < T$ the step rule lands below $T$ and skips no $g$ with
+$(v + Bg) \bmod M < T$. Hence, from the least candidate $j_0$, the steps visit every
+candidate.
+\end{lemma}
+\leanref{\lean{step_lands}, \lean{step_first}, \lean{enumeration_complete}}
+
+The lemma holds for every $T \le M$; the half-turn restriction often stated for the
+three-gap step rule is not needed.
+
+\begin{lemma}\label{lem:bridge}
+If $g(Q+30j) < W$, $2j \le \fn{slack}$, $T \le M$ and
+$T \ge \fn{slack} + 1 + E + (W-1)M/Q$ with $E \ge F(30j)^2M/Q^3$, then $v(j) < T$. Under the
+standard rounding model, $1 \le W \le 2^{48}$, $Q \ge 1$ and $\fn{slack} \ge 3$, the computed
+$t_d$ satisfies $t_d \ge \fn{slack} + 2 + F d_{\max}^2 M/Q^3 + (W-1)M/Q$.
+\end{lemma}
+\leanref{\lean{landing_candidate_fixed}, \lean{t_double_ok}}
+
+\begin{lemma}\label{lem:exact}
+If $8 \le Q < 2^{64}$, $F < 2^{62}Q$ and $30F < 2^{128}$, the 128-bit expressions for $X_0$
+and $S$ equal their exact values. The two correction loops of the exact check return
+$g(q)$ for every starting estimate, and with $60j \le Q$ the estimate $X_0 - Sj$ does not
+underflow and every intermediate $kq$ stays below $2^{128}$.
+\end{lemma}
+\leanref{\lean{cX0_eq}, \lean{cS_eq}, \lean{cLanding_eq}, \lean{estimate_safe}}
+
+\begin{lemma}\label{lem:gaps}
+When the subtractive walk of \lean{jump_gaps} succeeds, its result is $(g_a, g_c)$.
+\end{lemma}
+\leanref{\lean{jumpGaps_spec}}
+
+The walk keeps $d_a \equiv Bq_a$, $d_c \equiv -Bq_c \pmod M$, $q_a d_c + q_c d_a = M$ and
+$d_a + d_c \ge T$. The first three say that $(q_a, d_a)$ and $(q_c, -d_c)$ are a basis of the
+lattice $\{(g, r) : r \equiv Bg \bmod M\}$ of determinant $M$; a smaller step into $[0, T)$
+would give a lattice point excluded by the sign cases. The argument uses only the
+invariants, which gives the next result.
+
+\subsection*{T3 The engine bound}
+\begin{theorem}\label{thm:overflow}
+For $F = 1.2\cdot 10^{37}$ and $Q = 3\cdot 10^{18} + 1$ one has $F < 2^{126}$,
+$\lfloor F/2^{62}\rfloor + 1 \le Q$ and $Q^2 \le F$, and the C value of $S$ differs from the
+exact one.
+\end{theorem}
+\leanref{\lean{cS_overflow} (by \lean{decide})}
+
+At this $F$ the earlier guard $F < 2^{126}$ enabled the gear for this $Q$, but
+$30F \ge 2^{128}$, the product \lean{30 * first} wraps, and landings are lost. With the guard
+$F \le \lfloor (2^{128}-1)/30 \rfloor$ the engines' range and that of
+Theorem~\ref{thm:main} coincide.
+
+\subsection*{T4 A certificate for the steps}
+\begin{theorem}\label{thm:cert}
+Let $g_a, g_c \ge 1$, $d_a = Bg_a \bmod M$, $d_c = M - (Bg_c \bmod M)$. If
+\[
+ 1 \le d_a < T,\qquad d_c < T,\qquad T \le d_a + d_c,\qquad g_a d_c + g_c d_a = M,
+\]
+then $g_a$ and $g_c$ are the least three-gap steps for $(B, T)$.
+\end{theorem}
+\leanref{\lean{gaps_certificate}}
+
+\subsection*{T5 The cost model}
+The engines split the $q$ between the classic path, costing about $1/\ln q$ per unit of $q$,
+and the gear, costing about $C/q$ with $C = a\sqrt{F/W} + bW$; in v7.2, at block factor $f$,
+$C(f) = \alpha/f + \beta(1 + f^2/2)$ with $\alpha = 0.5\,a\sqrt{F/W}$ and
+$\beta = bW/1.125$.
+
+\begin{theorem}\label{thm:cost}
+Let $p^* \ge e$ satisfy $p^* = C\ln p^*$.
+\begin{enumerate}
+  \item For $q \ge e$ the gear is the cheaper path exactly for $q \ge p^*$, so the split at
+    $p^*$ is the cheapest of all assignments of a finite set of $q$ to the two paths.
+  \item For $C \ge 3$ a fixed point with $C \le p^* \le C^3$ exists, and the iteration
+    $p \leftarrow \max(C\ln p, 3)$ from $\max(C, 3)$ rises to it with error at most
+    $(1/\ln C)^k p^*$ after $k+1$ steps.
+  \item $f^* = (\alpha/\beta)^{1/3}$ minimises $C(f)$ over $f > 0$, also after clamping to
+    $[0.05, 64]$, and $f^*$ with the threshold of $C(f^*)$ costs no more than any block factor
+    with any assignment.
+\end{enumerate}
+\end{theorem}
+\leanref{\lean{gear_cheaper_above}, \lean{classic_cheaper_below}, \lean{threshold_optimal},
+\lean{fixedPoint_exists}, \lean{iterP_error}, \lean{blockCost_min},
+\lean{blockCost_clamp_min}, \lean{model_optimal}}
+
+The constants $a$ and $b$ are fitted to measurements (defaults $a = 300$, $b = 0.1$); that
+the model describes the machine is not proved. Neither the model nor its constants affect
+correctness, since Theorem~\ref{thm:main} holds for every threshold.
+
+\section{Use in the engines}\label{sec:engines}
+
+The formal results changed the engines in two commits of the PrimeAtlas
+repository~\cite{atlas}:
+\begin{itemize}
+  \item \lean{27fe0f5} (engines v7.0--v7.2): the gear is enabled only for
+    $F \le \lfloor (2^{128}-1)/30 \rfloor$ and $W \le 2^{48}$, the hypotheses of
+    Theorem~\ref{thm:main}; above them the classic path sieves. A block with
+    $F \ge 2^{62}Q$, which the earlier code left without landings, now checks every $q$, and
+    the block length is capped at $J \le Q/60$. Identity tests against the classic engine are
+    unchanged bit for bit.
+  \item \lean{ab4491b} (engine v7.4): each thread keeps the previous block's $(g_a, g_c)$ and
+    reuses it when the conditions of Theorem~\ref{thm:cert} hold, checked with exact 128-bit
+    products; otherwise it runs the walk. The C check transcribes the hypotheses of the
+    theorem directly; that transcription is not part of the formalization. The pair is kept
+    for about 57\,\% of blocks at v7.2's block factors. At $10^{11}$ numbers per run v7.4 is
+    5--13\,\% faster than v7.2 on floors 27--30 and equal to it within the spread below
+    (Section~\ref{sec:bench}).
+\end{itemize}
+
+\section{Relation to prior work}\label{sec:prior}
+
+Helfgott~\cite{helfgott} sieves an interval of half-width $\Delta$ around $n$ classically up to
+$K\Delta$ with $K \ge 5/2$, and above that replaces $n/m$ by its tangent line on blocks of
+length $R = \lfloor M\sqrt{\Delta/4n}\rfloor$, sieving by all integers $m$ in that range. He
+finds the candidates of a block by continued fractions, computing the modular inverse with
+them, and reaches time $O(\Delta \log n)$ when $\Delta \ge n^{1/3}(\log n)^{2/3}$. His
+implementation is a proof of concept tested up to $n = 5\cdot 10^{18}$; he remarks that above
+$2^{64}$ highly optimized implementations of the traditional algorithm are harder to find for
+comparison. The mathematical core of the jump gear is his method.
+
+The PrimeAtlas engines differ in the following points. They run the method from $10^{18}$ to
+$10^{30}$ in 64.64 fixed point with 128-bit arithmetic; they enumerate candidates by
+three-gap steps rather than continued fractions; they combine the gear with a bucketed
+classic path in the manner of Oliveira e Silva, Herzog and Pardi~\cite{oes}; and the split
+point is not a multiple of the window but the fixed point of the cost model of
+Theorem~\ref{thm:cost}, whose block term $a\sqrt{F/W}$ dominates for narrow windows. The runs
+of $10^9$ numbers at $F = 10^{26}$ in Section~\ref{sec:bench} lie below Helfgott's condition
+($n^{1/3}(\log n)^{2/3} \approx 7\cdot 10^9$ there).
+
+The three-gap theorem is due to S\'os~\cite{sos} and \'Swierczkowski~\cite{swierczkowski}; we
+use Slater's form~\cite{slater} for the gaps between successive returns to an interval.
+Galway~\cite{galway} reduces the space of the sieve of Atkin and Bernstein. For narrow
+windows at deep floors another route to proven primes is Sorenson's pseudosquares prime
+sieve~\cite{sorenson2006}.
+
+\section{Origin and measurements}\label{sec:bench}
+
+The measurements in this section are not part of the formal results. All runs used an AMD
+Ryzen~9 5900X (12 cores, 24 threads), 64\,GB RAM, WSL2, with 24 threads for every program.
+
+\subsection*{The profile that led to the gear}
+Engine v6.1 sieves a wheel-30 bitmap with primes from primesieve~\cite{primesieve}, small
+primes in cache-sized segments and large ones through buckets~\cite{oes}. At
+$F = 10^{25}$, $W = 2\cdot 10^{11}$ it spent 2--3\,s on start-up, 11--14\,s in the segmented
+stage and 120--130\,s in the bucket stage, about 90\,\% of the sieve. There are about
+$1.1\cdot 10^{11}$ primes below $\sqrt{F+W}$; a prime $p > W$ hits the window with
+probability $W/p$, but its generation and phase are paid either way. This led to asking
+which large $q$ land instead of where each prime lands.
+
+\subsection*{The threshold}
+On runs of $10^{10}$ numbers (v7.0 with a manual threshold, before the cost model existed),
+the best threshold grew by about $\sqrt{10}$ per floor, as the block term predicts:
+
+\begin{center}
+\begin{tabular}{rrrrr}
+\toprule
+floor & no gear (v6.1) & $p^* = 2.6\cdot10^{11}$ & best $p^*$ & best time \\
+\midrule
+26 & 217.6\,s & 116.4\,s & $8.2\cdot10^{11}$ & 101.5\,s \\
+27 & 739.3\,s & 373.9\,s & $2.9\cdot10^{12}$ & 263.9\,s \\
+28 & 2513.5\,s & 1178.3\,s & $\ge 8.9\cdot10^{12}$ & 756.1\,s \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection*{Speed}
+The speeds come from one series of 204 runs on 16 November 2026, recorded with its script in
+\lean{benchmarks/2026-11-16_engines} of the PrimeAtlas repository~\cite{atlas}. A run sieves
+$N$ consecutive numbers from $F = 10^k$ (floor $k$) in windows of $10^7$. Each point is the
+mean of two runs; on every floor the runs of engines v7.2 and v7.4 alternate in the order
+v7.2, v7.4, v7.4, v7.2. The comparison program is Walisch's Pseudosquares Prime
+Sieve~\cite{pss} (version 1.2, commit \lean{fccb96e}), which proves its output, in count
+mode at $10^9$ numbers per floor, the size of its own benchmarks. The times leave out the
+phase in which the engines write their windows: it depends on the disk, and the
+pseudosquares sieve in count mode writes nothing. Prime counts agree between all runs of a
+point and between the programs (for example $24\,127\,085$ at floor 18 and $15\,514\,691$ at
+floor 28).
+
+\begin{center}
+\begin{tabular}{rrrrrr}
+\toprule
+ & \multicolumn{1}{c}{PSS} & \multicolumn{3}{c}{engine v7.4} & \multicolumn{1}{c}{v7.2} \\
+\cmidrule(lr){2-2}\cmidrule(lr){3-5}\cmidrule(lr){6-6}
+floor & $N = 10^9$ & $N = 10^9$ & $N = 10^{10}$ & $N = 10^{11}$ & $N = 10^{11}$ \\
+\midrule
+18 & 203 & 2054 & 7310 & 7920 & 7989 \\
+19 & 145 & 1753 & 6224 & 8282 & 7707 \\
+20 & 43.9 & 1324 & 4858 & 7838 & 7558 \\
+21 & 41.4 & 959 & 3263 & 6831 & 7032 \\
+22 & 36.8 & 632 & 1783 & 5043 & 5391 \\
+23 & 34.2 & 383 & 1172 & 3744 & 3639 \\
+24 & 29.7 & 200 & 855 & 2377 & 2349 \\
+25 & 33.0 & 95.1 & 534 & 1594 & 1600 \\
+26 & 28.5 & 42.7 & 308 & 1120 & 1083 \\
+27 & 25.2 & 19.0 & 156 & 746 & 707 \\
+28 & 25.4 & 8.2 & 73.8 & 458 & 407 \\
+29 & 22.9 & 3.5 & 33.3 & 248 & 219 \\
+30 & 21.7 & 1.5 & 14.7 & 124 & 115 \\
+\bottomrule
+\end{tabular}
+
+\smallskip
+{\small Millions of numbers per second, without the write phase.}
+\end{center}
+
+At $10^{11}$ numbers per run, the size it is built for, engine v7.4 is faster than the
+pseudosquares sieve on every floor from 18 to 30. On runs of $10^9$ numbers it is faster up
+to floor 26 and with $10^{10}$ up to floor 29: larger runs amortise the per-run cost of the
+sieving primes. The engine uses up to 1.9\,GB for $10^9$ numbers, 8.2\,GB for $10^{10}$ and
+11.2\,GB for $10^{11}$; the pseudosquares sieve 0.8\,GB. Runs shorter than about a minute
+spread by up to 16\,\% between the two runs of a point; the spread of every point is in the
+repository.
+
+\section{Scope}\label{sec:scope}
+
+The proof concerns a model of the C code written in Lean, not the compiled binary; the
+agreement of model and code rests on the transcription, on the compiler, and on the engines'
+identity tests, which compare whole runs bit for bit with the classic engine. Floating point
+enters only through the standard rounding model. Outside the block routine the formalization
+covers the sieve argument (Theorem~\ref{thm:sieve}) but not the mapping of offsets to the
+wheel-30 bitmap or the bucket application, which the identity tests cover.
+
+\section{The formalization}\label{sec:formalization}
+
+The formalization is a Lean~4~\cite{lean4} project built against Mathlib~\cite{mathlib}, both
+at version \lean{v4.35.0}: \lean{GearProof/JumpGear.lean} (correctness, about 1900 lines)
+and \lean{GearProof/CostModel.lean} (cost model, about 300 lines, independent of the first).
+\lean{lake build} completes with no \lean{sorry}, \lean{admit} or \lean{native_decide}, and the
+theorems depend only on the axioms \lean{propext}, \lean{Quot.sound} and
+\lean{Classical.choice}. To build:
+\begin{verbatim}
+lake exe cache get
+lake build
+\end{verbatim}
+
+\section{Use of AI}
+
+The question that led to the gear (asking which large $q$ land in the window instead of where
+each prime lands, from the profile of engine v6.1), the gear's threshold from a cost model,
+and the choice of statements to prove are the author's. Generative AI (Claude Opus 5.5,
+Anthropic, used through Claude Code) contributed in the following ways:
+\begin{itemize}
+  \item It chose the technique that answers the question (tangent-line approximation,
+    three-gap steps), drawing on its general knowledge of the literature, which includes
+    Helfgott's method; it read Helfgott's paper after engine v7.0 was built. The author has
+    not read it.
+  \item It wrote the engine code and the Lean statements and proofs under the author's
+    direction. The author checked the statements against the engines and by measurement; the
+    correctness of the proofs rests on the Lean kernel.
+  \item It drafted this text and checked the identifiers of the references. The author set
+    the structure and the stated contributions.
+\end{itemize}
+
+\begin{thebibliography}{99}
+
+\bibitem{atlas}
+A.~Flamandzki,
+\emph{PrimeAtlas},
+\url{https://github.com/Flaman55/primeAtlas}.
+
+\bibitem{bayshudson}
+C.~Bays and R.~H.~Hudson,
+\emph{The segmented sieve of Eratosthenes and primes in arithmetic progressions to $10^{12}$},
+BIT 17 (1977), 121--127,
+\href{https://doi.org/10.1007/BF01932283}{doi:10.1007/BF01932283}.
+
+\bibitem{galway}
+W.~F.~Galway,
+\emph{Dissecting a sieve to cut its need for space},
+Algorithmic Number Theory (ANTS-IV), Lecture Notes in Computer Science 1838, 2000, 297--312,
+\href{https://doi.org/10.1007/10722028_17}{doi:10.1007/10722028\_17}.
+
+\bibitem{helfgott}
+H.~A.~Helfgott,
+\emph{An improved sieve of Eratosthenes},
+Math. Comp. 89 (2020), 333--350,
+\href{https://doi.org/10.1090/mcom/3438}{doi:10.1090/mcom/3438};
+\href{https://arxiv.org/abs/1712.09130}{arXiv:1712.09130}.
+
+\bibitem{higham}
+N.~J.~Higham,
+\emph{Accuracy and Stability of Numerical Algorithms}, 2nd ed., SIAM, 2002,
+\href{https://doi.org/10.1137/1.9780898718027}{doi:10.1137/1.9780898718027}.
+
+\bibitem{ieee754}
+\emph{IEEE Standard for Floating-Point Arithmetic}, IEEE Std 754-2019,
+\href{https://doi.org/10.1109/IEEESTD.2019.8766229}{doi:10.1109/IEEESTD.2019.8766229}.
+
+\bibitem{lean4}
+L.~de~Moura and S.~Ullrich,
+\emph{The Lean 4 theorem prover and programming language},
+Automated Deduction -- CADE 28, Lecture Notes in Computer Science 12699, 2021, 625--635,
+\href{https://doi.org/10.1007/978-3-030-79876-5_37}{doi:10.1007/978-3-030-79876-5\_37}.
+
+\bibitem{mathlib}
+The mathlib Community,
+\emph{The Lean mathematical library},
+Proceedings of the 9th ACM SIGPLAN International Conference on Certified Programs and Proofs
+(CPP 2020), 367--381,
+\href{https://doi.org/10.1145/3372885.3373824}{doi:10.1145/3372885.3373824}.
+
+\bibitem{oes}
+T.~Oliveira e Silva, S.~Herzog and S.~Pardi,
+\emph{Empirical verification of the even Goldbach conjecture and computation of prime gaps up
+to $4\cdot 10^{18}$},
+Math. Comp. 83 (2014), 2033--2060,
+\href{https://doi.org/10.1090/S0025-5718-2013-02787-1}{doi:10.1090/S0025-5718-2013-02787-1}.
+
+\bibitem{primesieve}
+K.~Walisch,
+\emph{primesieve},
+\url{https://github.com/kimwalisch/primesieve}.
+
+\bibitem{pss}
+K.~Walisch,
+\emph{Pseudosquares Prime Sieve},
+\url{https://github.com/kimwalisch/Pseudosquares-Prime-Sieve}.
+
+\bibitem{slater}
+N.~B.~Slater,
+\emph{Gaps and steps for the sequence $n\theta \bmod 1$},
+Proc. Cambridge Philos. Soc. 63 (1967), 1115--1123,
+\href{https://doi.org/10.1017/S0305004100042195}{doi:10.1017/S0305004100042195}.
+
+\bibitem{sorenson2006}
+J.~P.~Sorenson,
+\emph{The pseudosquares prime sieve},
+Algorithmic Number Theory (ANTS-VII), Lecture Notes in Computer Science 4076, 2006, 193--207,
+\href{https://doi.org/10.1007/11792086_15}{doi:10.1007/11792086\_15}.
+
+\bibitem{sos}
+V.~T.~S\'os,
+\emph{On the distribution mod 1 of the sequence $n\alpha$},
+Ann. Univ. Sci. Budapest. E\"otv\"os Sect. Math. 1 (1958), 127--134.
+
+\bibitem{swierczkowski}
+S.~\'Swierczkowski,
+\emph{On successive settings of an arc on the circumference of a circle},
+Fund. Math. 46 (1959), 187--189,
+\href{https://doi.org/10.4064/fm-46-2-187-189}{doi:10.4064/fm-46-2-187-189}.
+
+\end{thebibliography}
+
+\end{document}
